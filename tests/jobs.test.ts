@@ -69,5 +69,61 @@ describe("jobs", () => {
       expect(arg.queueCommandDto.command).toBe("start");
       expect(arg.queueCommandDto.force).toBe(true);
     });
+
+    it("non-destructive command (start) does NOT require confirm", async () => {
+      resetFakeSdk();
+      mockSdkResponse("runQueueCommandLegacy", { name: "thumbnailGeneration", isActive: true });
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerJobTools(server, cfgWrite);
+      const out = await callTool(server, "immich_run_job", {
+        id: "thumbnailGeneration",
+        command: "start",
+      }) as ToolResult;
+      expect(out.isError).toBeFalsy();
+      expect(sdkCalls.some((c) => c.fn === "runQueueCommandLegacy")).toBe(true);
+    });
+
+    it("empty command without confirm returns ConfirmRequiredError", async () => {
+      resetFakeSdk();
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerJobTools(server, cfgWrite);
+      const out = await callTool(server, "immich_run_job", {
+        id: "thumbnailGeneration",
+        command: "empty",
+      }) as ToolResult;
+      expect(out.isError).toBe(true);
+      expect(out.content[0]!.text).toMatch(/confirm: true/);
+      expect(sdkCalls.some((c) => c.fn === "runQueueCommandLegacy")).toBe(false);
+    });
+
+    it("empty command WITH confirm proceeds", async () => {
+      resetFakeSdk();
+      mockSdkResponse("runQueueCommandLegacy", { name: "thumbnailGeneration", isActive: false });
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerJobTools(server, cfgWrite);
+      const out = await callTool(server, "immich_run_job", {
+        id: "thumbnailGeneration",
+        command: "empty",
+        confirm: true,
+      }) as ToolResult;
+      expect(out.isError).toBeFalsy();
+      const call = sdkCalls.find((c) => c.fn === "runQueueCommandLegacy");
+      expect(call).toBeDefined();
+      const arg = call!.args[0] as { queueCommandDto: { command: string } };
+      expect(arg.queueCommandDto.command).toBe("empty");
+    });
+
+    it("clear-failed command without confirm returns ConfirmRequiredError", async () => {
+      resetFakeSdk();
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerJobTools(server, cfgWrite);
+      const out = await callTool(server, "immich_run_job", {
+        id: "thumbnailGeneration",
+        command: "clear-failed",
+      }) as ToolResult;
+      expect(out.isError).toBe(true);
+      expect(out.content[0]!.text).toMatch(/confirm: true/);
+      expect(sdkCalls.some((c) => c.fn === "runQueueCommandLegacy")).toBe(false);
+    });
   });
 });

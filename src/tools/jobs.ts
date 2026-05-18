@@ -8,6 +8,7 @@ import {
   asMcpError,
   surfaceError,
   requireWrites,
+  requireConfirm,
 } from "./_util.js";
 
 const JOB_IDS = [
@@ -52,15 +53,19 @@ export function registerJobTools(server: McpServer, config: Config): void {
 
   server.tool(
     "immich_run_job",
-    "Send a command to one of Immich's background jobs. Writes-gated.",
+    "Send a command to one of Immich's background jobs. Writes-gated. Destructive commands (empty, clear-failed) additionally require confirm:true.",
     {
       id: z.enum(JOB_IDS),
       command: z.enum(["start", "pause", "resume", "empty", "clear-failed"]),
       force: z.boolean().optional(),
+      confirm: z.boolean().optional(),
     },
     async (args) => {
       try {
         requireWrites(config);
+        if (args.command === "empty" || args.command === "clear-failed") {
+          requireConfirm("immich_run_job", args.confirm);
+        }
         const sdkAny = sdk as unknown as {
           runQueueCommandLegacy?: (a: {
             name: string;
