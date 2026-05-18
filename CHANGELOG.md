@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file. Format foll
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-18
+
+### Fixed
+- `immich_list_trash` now actually returns trashed items. The previous implementation passed `isTrashed: true` to `searchAssets`, which the Immich server silently ignored, so the tool returned non-trash assets from the main timeline. The tool now uses `withDeleted: true` plus an epoch sentinel for `trashedAfter` and post-filters the returned items to `isTrashed === true`.
+- `immich_restore_by_query` had the same search-side bug and additionally called `updateAssets({ isTrashed: false })`, which the SDK also silently dropped: nothing was ever restored. The tool now calls the dedicated `restoreAssets({ bulkIdsDto: { ids } })` endpoint, pages through trash until exhausted or `maxRestore` is hit, and requires `confirm: true` when invoked with no filter (would otherwise restore every trashed asset).
+- `immich_run_job` now requires `confirm: true` for destructive queue commands (`empty`, `clear-failed`). Other commands (`start`, `pause`, `resume`) are unchanged.
+- `immich_suggest_face_names` no longer returns `thumbnailPath` (a server-side file path that is not useful to callers and was not in the spec). Response shape is now `{ personId, faceCount }`; pair with `immich_get_person_assets` to fetch a sample asset per person.
+- `immich_search_then_album` now rejects when both `smartQuery` and `metadataFilter` are provided. The previous implementation silently dropped `metadataFilter`.
+- `immich_daily_digest` now filters new uploads by `createdAfter` (upload time) instead of `takenAfter` (capture time). New imports of old photos now count correctly.
+- `test:integration` script now builds the project before invoking the integration suite (`npm run build && IMMICH_INTEGRATION=true vitest ...`).
+- `withRetry` now logs one stderr line per retry attempt for minimal production observability. The `label` parameter is no longer discarded.
+
 ## [0.3.0] - 2026-05-18
 
 ### Added
