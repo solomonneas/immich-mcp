@@ -32,6 +32,9 @@ export function registerAlbumFlowTools(server: McpServer, config: Config): void 
         if (!smartQuery && !metadataFilter) {
           return asMcpError("Either smartQuery or metadataFilter is required.");
         }
+        if (smartQuery && metadataFilter) {
+          return asMcpError("Provide exactly one of smartQuery or metadataFilter.");
+        }
         const size = limit ?? 200;
         let assetIds: string[] = [];
         if (smartQuery) {

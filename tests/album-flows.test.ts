@@ -45,6 +45,21 @@ describe("album-flows - immich_search_then_album", () => {
     expect(out.content[0]!.text).toContain("smartQuery");
   });
 
+  it("refuses when BOTH smartQuery and metadataFilter are provided", async () => {
+    resetFakeSdk();
+    const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+    registerAlbumFlowTools(server, cfgWrite);
+    const out = await callTool(server, "immich_search_then_album", {
+      albumName: "Trip",
+      smartQuery: "beach",
+      metadataFilter: { city: "Paris" },
+    }) as ToolResult;
+    expect(out.isError).toBe(true);
+    expect(out.content[0]!.text).toMatch(/exactly one/);
+    // Critical: must not silently drop one or the other and proceed
+    expect(sdkCalls.some((c) => c.fn === "searchAssets" || c.fn === "searchSmart" || c.fn === "createAlbum")).toBe(false);
+  });
+
   it("with smartQuery: calls searchSmart then createAlbum with matched asset ids", async () => {
     resetFakeSdk();
     mockSdkResponse("searchSmart", {
