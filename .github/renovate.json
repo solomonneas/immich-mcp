@@ -1,0 +1,24 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["every weekend"],
+  "dependencyDashboard": true,
+  "packageRules": [
+    {
+      "matchPackageNames": ["@immich/sdk"],
+      "groupName": "@immich/sdk",
+      "automerge": false
+    },
+    {
+      "matchPackageNames": ["@modelcontextprotocol/sdk"],
+      "groupName": "@modelcontextprotocol/sdk",
+      "automerge": false
+    },
+    {
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchPackageNames": ["!@immich/sdk", "!@modelcontextprotocol/sdk"],
+      "groupName": "non-critical minor + patch",
+      "automerge": true
+    }
+  ]
+}
