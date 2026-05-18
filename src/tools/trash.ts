@@ -11,10 +11,26 @@ import {
   requireConfirm,
 } from "./_util.js";
 
+// Earliest sentinel for "any trashed item" - Immich treats trashedAfter as inclusive,
+// so an epoch-zero timestamp matches every trashed asset regardless of trash date.
+const TRASH_ALL_SENTINEL = "1970-01-01T00:00:00.000Z";
+
+interface TrashSearchItem {
+  id: string;
+  isTrashed?: boolean;
+}
+
+interface TrashSearchResponse {
+  assets?: {
+    items?: TrashSearchItem[];
+    nextPage?: string | null;
+  };
+}
+
 export function registerTrashTools(server: McpServer, config: Config): void {
   server.tool(
     "immich_list_trash",
-    "List trashed assets, paginated. Filter by takenAfter/takenBefore/type.",
+    "List trashed assets, paginated. Uses withDeleted:true and trashedAfter sentinel to scope to trash. Filter by takenAfter/takenBefore/type.",
     {
       takenAfter: z.string().datetime().optional(),
       takenBefore: z.string().datetime().optional(),
@@ -25,9 +41,26 @@ export function registerTrashTools(server: McpServer, config: Config): void {
     async (args) => {
       try {
         const res = await withRetry("searchAssets:trash", () =>
-          sdk.searchAssets({ metadataSearchDto: { ...args, isTrashed: true } as never }),
+          sdk.searchAssets({
+            metadataSearchDto: {
+              ...args,
+              withDeleted: true,
+              trashedAfter: TRASH_ALL_SENTINEL,
+            } as never,
+          }),
         );
-        return asMcpResponse(res);
+        // Post-filter to trashed-only as belt-and-suspenders against any future
+        // SDK/server change that broadens trashedAfter semantics.
+        const r = res as TrashSearchResponse;
+        const items = (r.assets?.items ?? []).filter((a) => a.isTrashed === true);
+        const out = {
+          ...(r as object),
+          assets: {
+            ...(r.assets ?? {}),
+            items,
+          },
+        };
+        return asMcpResponse(out);
       } catch (e) {
         return asMcpError(surfaceError(e));
       }
@@ -36,33 +69,68 @@ export function registerTrashTools(server: McpServer, config: Config): void {
 
   server.tool(
     "immich_restore_by_query",
-    "Restore trashed assets matching a filter. Writes-gated. Recoverable (just flips isTrashed).",
+    "Restore trashed assets matching a filter. Writes-gated. Calls SDK restoreAssets. With NO filter args, requires confirm:true (would restore every trashed asset).",
     {
       takenAfter: z.string().datetime().optional(),
       takenBefore: z.string().datetime().optional(),
       type: z.enum(["IMAGE", "VIDEO", "AUDIO", "OTHER"]).optional(),
       maxRestore: z.number().int().min(1).max(20000).optional(),
+      confirm: z.boolean().optional(),
     },
     async (args) => {
       try {
         requireWrites(config);
+        const hasFilter = Boolean(args.takenAfter || args.takenBefore || args.type);
+        if (!hasFilter && args.confirm !== true) {
+          return asMcpError(
+            "immich_restore_by_query with no filter would restore all trashed assets. Pass { confirm: true } to proceed, or add a takenAfter/takenBefore/type filter.",
+          );
+        }
         const cap = args.maxRestore ?? 5000;
-        const { maxRestore: _omit, ...filter } = args;
-        void _omit;
-        const search = await withRetry("searchAssets:trash", () =>
-          sdk.searchAssets({
-            metadataSearchDto: { ...filter, isTrashed: true, size: 1000 } as never,
-          }),
-        );
-        const ids = ((search as unknown as { assets?: { items?: { id: string }[] } }).assets?.items ?? []).map((a) => a.id);
+        const { maxRestore: _omitCap, confirm: _omitConfirm, ...filter } = args;
+        void _omitCap;
+        void _omitConfirm;
+
+        const ids: string[] = [];
+        let nextPage: string | null | undefined = undefined;
+        // Page through trash results until exhausted or cap exceeded.
+        // searchAssets nextPage is a stringified page number per the Immich API.
+        let page: number | undefined = undefined;
+        const pageSize = 1000;
+        for (;;) {
+          const search = await withRetry("searchAssets:trash", () =>
+            sdk.searchAssets({
+              metadataSearchDto: {
+                ...filter,
+                withDeleted: true,
+                trashedAfter: TRASH_ALL_SENTINEL,
+                size: pageSize,
+                ...(page !== undefined ? { page } : {}),
+              } as never,
+            }),
+          );
+          const r = search as TrashSearchResponse;
+          const items = (r.assets?.items ?? []).filter((a) => a.isTrashed === true);
+          for (const a of items) {
+            ids.push(a.id);
+            if (ids.length > cap) break;
+          }
+          if (ids.length > cap) break;
+          nextPage = r.assets?.nextPage;
+          if (!nextPage) break;
+          const parsed = parseInt(nextPage, 10);
+          if (!Number.isFinite(parsed)) break;
+          page = parsed;
+        }
+
         if (ids.length === 0) return asMcpResponse({ restored: 0 });
         if (ids.length > cap) {
           return asMcpError(
-            `match count ${ids.length} exceeds maxRestore=${cap}. Tighten the filter or raise maxRestore.`,
+            `match count exceeds maxRestore=${cap} (collected ${ids.length} so far). Tighten the filter or raise maxRestore.`,
           );
         }
-        await withRetry("updateAssets:restore", () =>
-          sdk.updateAssets({ assetBulkUpdateDto: { ids, isTrashed: false } as never }),
+        await withRetry("restoreAssets", () =>
+          sdk.restoreAssets({ bulkIdsDto: { ids } as never }),
         );
         return asMcpResponse({ restored: ids.length });
       } catch (e) {

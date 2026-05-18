@@ -51,7 +51,7 @@ export function installFakeSdk(): void {
       "searchMemories", "getMemory",
       "getAssetDuplicates",
       "searchStacks", "getStack", "createStack", "updateStack", "deleteStack",
-      "emptyTrash", "restoreTrash", "getQueuesLegacy", "runQueueCommandLegacy",
+      "emptyTrash", "restoreTrash", "restoreAssets", "getQueuesLegacy", "runQueueCommandLegacy",
       "init",
     ];
     const out: Record<string, unknown> = {};

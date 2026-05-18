@@ -24,7 +24,7 @@ function parsePayload(out: unknown): Record<string, unknown> {
 
 describe("trash", () => {
   describe("immich_list_trash", () => {
-    it("calls searchAssets with isTrashed: true", async () => {
+    it("calls searchAssets with withDeleted:true and trashedAfter sentinel (NOT isTrashed)", async () => {
       resetFakeSdk();
       mockSdkResponse("searchAssets", { assets: { items: [] } });
       const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
@@ -33,9 +33,31 @@ describe("trash", () => {
       expect(out.isError).toBeFalsy();
       const call = sdkCalls.find((c) => c.fn === "searchAssets");
       expect(call).toBeDefined();
-      const dto = (call!.args[0] as { metadataSearchDto: { isTrashed: boolean; size: number } }).metadataSearchDto;
-      expect(dto.isTrashed).toBe(true);
+      const dto = (call!.args[0] as { metadataSearchDto: Record<string, unknown> }).metadataSearchDto;
+      expect(dto.withDeleted).toBe(true);
+      expect(typeof dto.trashedAfter).toBe("string");
       expect(dto.size).toBe(50);
+      // critical: must NOT pass the silently-ignored isTrashed flag
+      expect("isTrashed" in dto).toBe(false);
+    });
+
+    it("post-filters returned items to isTrashed:true only", async () => {
+      resetFakeSdk();
+      mockSdkResponse("searchAssets", {
+        assets: {
+          items: [
+            { id: "live", isTrashed: false },
+            { id: "trashed-1", isTrashed: true },
+            { id: "trashed-2", isTrashed: true },
+            { id: "no-flag" },
+          ],
+        },
+      });
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerTrashTools(server, cfgRead);
+      const out = await callTool(server, "immich_list_trash") as ToolResult;
+      const body = parsePayload(out) as { assets: { items: Array<{ id: string }> } };
+      expect(body.assets.items.map((i) => i.id)).toEqual(["trashed-1", "trashed-2"]);
     });
   });
 
@@ -44,9 +66,45 @@ describe("trash", () => {
       resetFakeSdk();
       const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
       registerTrashTools(server, cfgRead);
-      const out = await callTool(server, "immich_restore_by_query", {}) as ToolResult;
+      const out = await callTool(server, "immich_restore_by_query", { confirm: true }) as ToolResult;
       expect(out.isError).toBe(true);
       expect(out.content[0]!.text).toMatch(/Writes disabled/);
+    });
+
+    it("refuses with no filter and no confirm", async () => {
+      resetFakeSdk();
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerTrashTools(server, cfgWrite);
+      const out = await callTool(server, "immich_restore_by_query", {}) as ToolResult;
+      expect(out.isError).toBe(true);
+      expect(out.content[0]!.text).toMatch(/confirm: true/);
+      expect(sdkCalls.some((c) => c.fn === "searchAssets")).toBe(false);
+      expect(sdkCalls.some((c) => c.fn === "restoreAssets")).toBe(false);
+    });
+
+    it("with a filter, does NOT require confirm", async () => {
+      resetFakeSdk();
+      mockSdkResponse("searchAssets", { assets: { items: [] } });
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerTrashTools(server, cfgWrite);
+      const out = await callTool(server, "immich_restore_by_query", { type: "IMAGE" }) as ToolResult;
+      expect(out.isError).toBeFalsy();
+      const body = parsePayload(out);
+      expect(body.restored).toBe(0);
+    });
+
+    it("with confirm:true and no filter, proceeds (and uses sentinel scope)", async () => {
+      resetFakeSdk();
+      mockSdkResponse("searchAssets", { assets: { items: [] } });
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerTrashTools(server, cfgWrite);
+      const out = await callTool(server, "immich_restore_by_query", { confirm: true }) as ToolResult;
+      expect(out.isError).toBeFalsy();
+      const call = sdkCalls.find((c) => c.fn === "searchAssets");
+      const dto = (call!.args[0] as { metadataSearchDto: Record<string, unknown> }).metadataSearchDto;
+      expect(dto.withDeleted).toBe(true);
+      expect(typeof dto.trashedAfter).toBe("string");
+      expect("isTrashed" in dto).toBe(false);
     });
 
     it("returns { restored: 0 } when search returns empty", async () => {
@@ -54,42 +112,48 @@ describe("trash", () => {
       mockSdkResponse("searchAssets", { assets: { items: [] } });
       const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
       registerTrashTools(server, cfgWrite);
-      const out = await callTool(server, "immich_restore_by_query", {}) as ToolResult;
+      const out = await callTool(server, "immich_restore_by_query", { confirm: true }) as ToolResult;
       expect(out.isError).toBeFalsy();
       const body = parsePayload(out);
       expect(body.restored).toBe(0);
-      expect(sdkCalls.some((c) => c.fn === "updateAssets")).toBe(false);
+      expect(sdkCalls.some((c) => c.fn === "restoreAssets")).toBe(false);
     });
 
-    it("calls updateAssets with isTrashed: false and the matched ids", async () => {
+    it("calls restoreAssets (NOT updateAssets) with the matched ids", async () => {
       resetFakeSdk();
       mockSdkResponse("searchAssets", {
-        assets: { items: [{ id: "a1" }, { id: "a2" }, { id: "a3" }] },
+        assets: {
+          items: [
+            { id: "a1", isTrashed: true },
+            { id: "a2", isTrashed: true },
+            { id: "a3", isTrashed: true },
+          ],
+        },
       });
-      mockSdkResponse("updateAssets", undefined);
+      mockSdkResponse("restoreAssets", undefined);
       const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
       registerTrashTools(server, cfgWrite);
-      const out = await callTool(server, "immich_restore_by_query", {}) as ToolResult;
+      const out = await callTool(server, "immich_restore_by_query", { confirm: true }) as ToolResult;
       expect(out.isError).toBeFalsy();
-      const upd = sdkCalls.find((c) => c.fn === "updateAssets");
-      expect(upd).toBeDefined();
-      const dto = (upd!.args[0] as { assetBulkUpdateDto: { ids: string[]; isTrashed: boolean } }).assetBulkUpdateDto;
+      const restore = sdkCalls.find((c) => c.fn === "restoreAssets");
+      expect(restore).toBeDefined();
+      const dto = (restore!.args[0] as { bulkIdsDto: { ids: string[] } }).bulkIdsDto;
       expect(dto.ids).toEqual(["a1", "a2", "a3"]);
-      expect(dto.isTrashed).toBe(false);
+      expect(sdkCalls.some((c) => c.fn === "updateAssets")).toBe(false);
       const body = parsePayload(out);
       expect(body.restored).toBe(3);
     });
 
     it("refuses when match count exceeds maxRestore", async () => {
       resetFakeSdk();
-      const items = Array.from({ length: 10 }, (_, i) => ({ id: `a${i}` }));
+      const items = Array.from({ length: 10 }, (_, i) => ({ id: `a${i}`, isTrashed: true }));
       mockSdkResponse("searchAssets", { assets: { items } });
       const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
       registerTrashTools(server, cfgWrite);
-      const out = await callTool(server, "immich_restore_by_query", { maxRestore: 5 }) as ToolResult;
+      const out = await callTool(server, "immich_restore_by_query", { maxRestore: 5, confirm: true }) as ToolResult;
       expect(out.isError).toBe(true);
       expect(out.content[0]!.text).toMatch(/exceeds maxRestore/);
-      expect(sdkCalls.some((c) => c.fn === "updateAssets")).toBe(false);
+      expect(sdkCalls.some((c) => c.fn === "restoreAssets")).toBe(false);
     });
   });
 
