@@ -8,11 +8,14 @@ function makeStatusError(status: number, message = "boom"): Error {
 }
 
 describe("withRetry", () => {
+  let errSpy: ReturnType<typeof vi.spyOn>;
   beforeEach(() => {
     vi.useFakeTimers();
+    errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   });
   afterEach(() => {
     vi.useRealTimers();
+    errSpy.mockRestore();
   });
 
   it("returns the value when fn succeeds on the first try", async () => {

@@ -12,7 +12,6 @@ function jitter(ms: number): number {
 }
 
 export async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
-  void label;
   let lastErr: unknown;
   for (let attempt = 0; attempt < BACKOFF_MS.length + 1; attempt++) {
     try {
@@ -20,6 +19,10 @@ export async function withRetry<T>(label: string, fn: () => Promise<T>): Promise
     } catch (e) {
       lastErr = e;
       if (attempt >= BACKOFF_MS.length || !isRetryable(e)) throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(
+        `[immich-mcp] retry ${attempt + 1}/${BACKOFF_MS.length} for ${label}: ${msg}`,
+      );
       const wait = jitter(BACKOFF_MS[attempt]!);
       await new Promise((resolve) => setTimeout(resolve, wait));
     }
