@@ -112,7 +112,22 @@ describe("memory-flows", () => {
       expect(md).toContain("20 videos");
       expect(md).toContain("Memory lanes today:** 2");
       expect(md).toContain("last 48h");
-      expect(md).toContain("New uploads (last 48h):** 3");
+      expect(md).toContain("Uploaded in the last 48h:** 3");
+    });
+
+    it("filters new uploads by createdAfter (upload time) NOT takenAfter (capture time)", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAssetStatistics", { images: 0, videos: 0, total: 0 });
+      mockSdkResponse("searchMemories", []);
+      mockSdkResponse("searchAssets", { assets: { items: [] } });
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerMemoryFlowTools(server, cfgRead);
+      await callTool(server, "immich_daily_digest", { sinceHours: 24 });
+      const searchCall = sdkCalls.find((c) => c.fn === "searchAssets");
+      expect(searchCall).toBeDefined();
+      const dto = (searchCall!.args[0] as { metadataSearchDto: Record<string, unknown> }).metadataSearchDto;
+      expect(typeof dto.createdAfter).toBe("string");
+      expect(dto.takenAfter).toBeUndefined();
     });
   });
 });

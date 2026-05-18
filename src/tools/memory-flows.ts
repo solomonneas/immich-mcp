@@ -46,7 +46,7 @@ export function registerMemoryFlowTools(server: McpServer, _config: Config): voi
 
   server.tool(
     "immich_daily_digest",
-    "Composite: server stats + today's memory lanes + last 24h uploads. Markdown text payload suitable for cron-driven Discord/Telegram drops.",
+    "Composite: server stats + today's memory lanes + assets uploaded to Immich in the last N hours (filtered by createdAfter, not capture date). Markdown text payload suitable for cron-driven Discord/Telegram drops.",
     {
       sinceHours: z.number().int().min(1).max(168).optional(),
     },
@@ -60,7 +60,7 @@ export function registerMemoryFlowTools(server: McpServer, _config: Config): voi
             sdk.searchMemories({ $for: new Date().toISOString(), isTrashed: false }),
           ),
           withRetry("searchAssets", () =>
-            sdk.searchAssets({ metadataSearchDto: { takenAfter: since, size: 20 } as never }),
+            sdk.searchAssets({ metadataSearchDto: { createdAfter: since, size: 20 } as never }),
           ),
         ]);
         const s = stats as unknown as { images: number; videos: number; total: number };
@@ -72,7 +72,7 @@ export function registerMemoryFlowTools(server: McpServer, _config: Config): voi
           ``,
           `**Library:** ${s.total} assets (${s.images} photos, ${s.videos} videos)`,
           `**Memory lanes today:** ${memCount}`,
-          `**New uploads (last ${hours}h):** ${recentItems.length}`,
+          `**Uploaded in the last ${hours}h:** ${recentItems.length}`,
         ].join("\n");
         return asMcpResponse({
           markdown: md,
