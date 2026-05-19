@@ -1,6 +1,6 @@
 {
   "name": "immich-mcp",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "MCP server for Immich — browse and search photos, manage albums, recognize people, surface memories, resolve duplicates, manage stacks via LLM tool calls",
   "type": "module",
   "main": "dist/index.js",

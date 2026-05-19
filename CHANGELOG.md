@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file. Format foll
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-18
+
+### Added
+- New `safetyMode` input on `immich_find_byte_dupes` + `immich_resolve_with_keep_strategy` with three levels:
+  - `strict-checksum` (default): Immich CLIP group + SHA1 match. Zero false positives.
+  - `clip-name-size-time`: CLIP group + filename + size + fileCreatedAt all match. Catches re-encodes/re-imports.
+  - `clip-only`: CLIP group only. Most permissive, requires manual review.
+- New tool `immich_find_clip_dupes` - finds visual-not-byte-identical CLIP-grouped pairs and reports a per-bucket divergence summary (checksums/filenames/sizes/takenAt).
+- New tool `immich_compare_assets` - side-by-side metadata diff of 2-10 assets with divergence + recommendation string.
+- New tool `immich_audit_active` - housekeeping candidates in the active library, with `excludeAlbumAssets` + `excludeFavorites` defaulting to true so curated content is skipped.
+
+### Changed (behavior change)
+- `matchMode` input deprecated in favor of `safetyMode`. `matchMode: "checksum"` still works as an alias for `safetyMode: "strict-checksum"`.
+- `matchMode: "name-size"` now returns a deprecation error directing users to `safetyMode: "clip-name-size-time"` (which is safer because it also requires `fileCreatedAt` to match, not just `filename`+`size`).
+- `matchReason` enum gains `clip-name-size-time` and `clip-only` to label safety-mode buckets honestly.
+
 ## [0.4.2] - 2026-05-18
 
 ### Changed (behavior change)

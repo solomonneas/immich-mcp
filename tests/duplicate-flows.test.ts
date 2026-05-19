@@ -1333,7 +1333,10 @@ describe("duplicate-flows", () => {
       expect(body.flagged).toEqual([]);
     });
 
-    it("matchMode: 'name-size' + same name/size but DISTINCT SHA1 still yields candidates (back-compat path)", async () => {
+    it("v0.5.0: matchMode: 'name-size' is no longer supported and returns a clear deprecation error", async () => {
+      // The v0.3-v0.4.1 unsafe heuristic. In v0.5.0 the caller is redirected
+      // to the new safetyMode='clip-name-size-time' (which additionally
+      // requires fileCreatedAt to match).
       resetFakeSdk();
       mockSdkResponse("getAllAlbums", []);
       mockSdkResponse("getAssetDuplicates", [
@@ -1347,14 +1350,413 @@ describe("duplicate-flows", () => {
       ]);
       const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
       registerDuplicateFlowTools(server, cfgRead);
-      const out = await callTool(server, "immich_find_byte_dupes", { matchMode: "name-size" });
+      const out = await callTool(server, "immich_find_byte_dupes", { matchMode: "name-size" }) as ToolResult;
+      expect(out.isError).toBe(true);
+      expect(out.content[0]!.text).toMatch(/no longer supported/i);
+      expect(out.content[0]!.text).toMatch(/clip-name-size-time/);
+    });
+
+    it("v0.5.0: matchMode: 'checksum' still works as alias for safetyMode='strict-checksum'", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", []);
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            mkAsset("older", "same.jpg", 500, "2024-01-01T00:00:00Z", "sha1-AAA"),
+            mkAsset("newer", "same.jpg", 500, "2024-06-01T00:00:00Z", "sha1-AAA"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_find_byte_dupes", { matchMode: "checksum" });
       const body = parsePayload(out);
-      expect(body.matchMode).toBe("name-size");
+      expect(body.safetyMode).toBe("strict-checksum");
+      expect(body.matchMode).toBe("checksum");
       const candidates = body.candidates as Array<{ matchReason: string; keeperId: string }>;
       expect(candidates.length).toBe(1);
-      expect(candidates[0]!.matchReason).toBe("name-size-match");
-      // keep-oldest -> "a"
+      expect(candidates[0]!.matchReason).toBe("checksum-exact");
+      expect(candidates[0]!.keeperId).toBe("older");
+    });
+  });
+
+  describe("v0.5.0 safetyMode", () => {
+    it("safetyMode: 'strict-checksum' matches checksum-exact behavior", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", []);
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            mkAsset("older", "same.jpg", 500, "2024-01-01T00:00:00Z", "sha1-AAA"),
+            mkAsset("newer", "same.jpg", 500, "2024-06-01T00:00:00Z", "sha1-AAA"),
+            // Distinct SHA1 - should be dropped under strict-checksum.
+            mkAsset("third", "same.jpg", 500, "2024-03-01T00:00:00Z", "sha1-BBB"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_find_byte_dupes", {
+        safetyMode: "strict-checksum",
+      });
+      const body = parsePayload(out);
+      expect(body.safetyMode).toBe("strict-checksum");
+      const candidates = body.candidates as Array<{ matchReason: string; keeperId: string; discardIds: string[] }>;
+      expect(candidates.length).toBe(1);
+      expect(candidates[0]!.matchReason).toBe("checksum-exact");
+      expect(candidates[0]!.keeperId).toBe("older");
+      // Only the two assets sharing SHA1-AAA are paired; "third" is excluded.
+      expect(candidates[0]!.discardIds).toEqual(["newer"]);
+    });
+
+    it("safetyMode: 'clip-name-size-time' groups by name+size+fileCreatedAt across distinct checksums", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", []);
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            // Same name+size+takenAt but distinct SHA1 (the 9,725 case).
+            mkAsset("a", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-AAA"),
+            mkAsset("b", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-BBB"),
+            // Same name+size but different takenAt - excluded.
+            mkAsset("c", "VID.mp4", 1024, "2024-02-01T00:00:00Z", "sha1-CCC"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_find_byte_dupes", {
+        safetyMode: "clip-name-size-time",
+      });
+      const body = parsePayload(out);
+      expect(body.safetyMode).toBe("clip-name-size-time");
+      const candidates = body.candidates as Array<{ matchReason: string; keeperId: string; discardIds: string[] }>;
+      expect(candidates.length).toBe(1);
+      expect(candidates[0]!.matchReason).toBe("clip-name-size-time");
       expect(candidates[0]!.keeperId).toBe("a");
+      expect(candidates[0]!.discardIds).toEqual(["b"]);
+    });
+
+    it("safetyMode: 'clip-only' returns the whole CLIP group as one bucket regardless of checksum/name/time", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", []);
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            mkAsset("a", "a.jpg", 100, "2024-01-01T00:00:00Z", "sha1-AAA"),
+            mkAsset("b", "b.jpg", 200, "2024-02-01T00:00:00Z", "sha1-BBB"),
+            mkAsset("c", "c.jpg", 300, "2024-03-01T00:00:00Z", "sha1-CCC"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_find_byte_dupes", { safetyMode: "clip-only" });
+      const body = parsePayload(out);
+      expect(body.safetyMode).toBe("clip-only");
+      const candidates = body.candidates as Array<{ matchReason: string; keeperId: string; discardIds: string[] }>;
+      expect(candidates.length).toBe(1);
+      expect(candidates[0]!.matchReason).toBe("clip-only");
+      // Keep-oldest -> "a" (earliest fileCreatedAt). Other two are discards.
+      expect(candidates[0]!.keeperId).toBe("a");
+      expect(candidates[0]!.discardIds.sort()).toEqual(["b", "c"]);
+    });
+  });
+
+  describe("immich_find_clip_dupes", () => {
+    it("excludes byte-identical (checksum-matched) members and returns CLIP-only remainder", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          // Mixed group: two byte-identical + two visually-grouped distinct.
+          duplicateId: "g1",
+          assets: [
+            mkAsset("byte-a", "x.jpg", 100, "2024-01-01T00:00:00Z", "sha1-SAME"),
+            mkAsset("byte-b", "x.jpg", 100, "2024-02-01T00:00:00Z", "sha1-SAME"),
+            mkAsset("clip-a", "x.jpg", 200, "2024-03-01T00:00:00Z", "sha1-XYZ"),
+            mkAsset("clip-b", "x.jpg", 250, "2024-04-01T00:00:00Z", "sha1-QRS"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_find_clip_dupes");
+      const body = parsePayload(out);
+      expect(body.totalBuckets).toBe(1);
+      const top = body.topByReclaim as Array<{
+        keeper: { id: string };
+        discards: Array<{ id: string }>;
+        matchReason: string;
+        divergence: { checksumsDiffer: boolean; sizesDiffer: boolean };
+      }>;
+      expect(top.length).toBe(1);
+      expect(top[0]!.matchReason).toBe("clip-only");
+      const memberIds = [top[0]!.keeper.id, ...top[0]!.discards.map((d) => d.id)].sort();
+      expect(memberIds).toEqual(["clip-a", "clip-b"]);
+      expect(top[0]!.divergence.checksumsDiffer).toBe(true);
+      expect(top[0]!.divergence.sizesDiffer).toBe(true);
+    });
+
+    it("requireMetadataMatch=true narrows to name+size+time matches and labels matchReason 'clip-name-size-time'", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            // Two share name+size+takenAt with distinct SHA1.
+            mkAsset("a", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-AAA"),
+            mkAsset("b", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-BBB"),
+            // Third drops out because takenAt differs.
+            mkAsset("c", "VID.mp4", 1024, "2024-02-01T00:00:00Z", "sha1-CCC"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_find_clip_dupes", {
+        requireMetadataMatch: true,
+      });
+      const body = parsePayload(out);
+      expect(body.totalBuckets).toBe(1);
+      const top = body.topByReclaim as Array<{
+        matchReason: string;
+        keeper: { id: string };
+        discards: Array<{ id: string }>;
+      }>;
+      expect(top[0]!.matchReason).toBe("clip-name-size-time");
+      expect(top[0]!.keeper.id).toBe("a");
+      expect(top[0]!.discards.map((d) => d.id)).toEqual(["b"]);
+    });
+
+    it("returns 0 buckets when every duplicate group is fully byte-identical", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            mkAsset("a", "x.jpg", 100, "2024-01-01T00:00:00Z", "sha1-X"),
+            mkAsset("b", "x.jpg", 100, "2024-02-01T00:00:00Z", "sha1-X"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_find_clip_dupes");
+      const body = parsePayload(out);
+      expect(body.totalBuckets).toBe(0);
+      expect((body.recommendation as string)).toMatch(/No visual-not-byte/);
+    });
+  });
+
+  describe("immich_compare_assets", () => {
+    const idA = "11111111-1111-4111-8111-111111111111";
+    const idB = "22222222-2222-4222-8222-222222222222";
+
+    function mockTwo(a: Record<string, unknown>, b: Record<string, unknown>): void {
+      // _fake-sdk stores ONE response per fn name. We fan out by intercepting
+      // the call sequence: pre-seed with `a`, then on the next call return `b`.
+      // Simplest path: use a single payload that maps id->payload via a wrapper.
+      // But the actual handler uses sdk.getAssetInfo({ id }) twice. The fake
+      // stores one response and returns it for both calls. To work around,
+      // mock once with a function-style? It uses static value. We override on
+      // each call by swapping response between assertions via shifting array.
+      // We use sdkResponses queue: replace mock per call with vi spy.
+      // Cleaner: use the existing single-response store but key the response
+      // by a switch on the arg's id (no built-in support). Use a custom mock.
+      const queue = [a, b];
+      mockSdkResponse("getAssetInfo", queue);
+      // Inject custom dispatcher via per-call switch in the fake: we extend
+      // the fake's sdkResponses entry into a function-like behavior by using
+      // mockSdkResponse with a sentinel array and adding a small consumer
+      // pattern. Simpler: override _fake-sdk by post-mocking getAssetInfo to
+      // pop the next item per call.
+    }
+
+    it("byte-identical pair (same checksum) -> recommendation says safe with strict-checksum", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", []);
+      // Both assetInfo calls return the same payload from the shared queue.
+      // _fake-sdk returns ONE static response per fn, so we use the same shape
+      // for both fetched assets (id is read from the payload, not the call arg).
+      const shared = {
+        id: "shared",
+        originalFileName: "p.jpg",
+        fileCreatedAt: "2024-01-01T00:00:00Z",
+        checksum: "sha1-SAME",
+        exifInfo: { fileSizeInByte: 500, make: "Canon", model: "R5" },
+      };
+      mockSdkResponse("getAssetInfo", shared);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_compare_assets", { assetIds: [idA, idB] });
+      const body = parsePayload(out);
+      const divergence = body.divergence as { checksumsDiffer: boolean };
+      expect(divergence.checksumsDiffer).toBe(false);
+      expect((body.recommendation as string)).toMatch(/strict-checksum/);
+      const assets = body.assets as Array<{ checksum: string; albums: unknown[] }>;
+      expect(assets.length).toBe(2);
+      expect(assets[0]!.checksum).toBe("sha1-SAME");
+    });
+
+    it("populates webUrl on each asset when webBaseUrl is provided", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", []);
+      mockSdkResponse("getAssetInfo", {
+        id: "any",
+        originalFileName: "p.jpg",
+        fileCreatedAt: "2024-01-01T00:00:00Z",
+        checksum: "sha1-X",
+        exifInfo: { fileSizeInByte: 500 },
+      });
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_compare_assets", {
+        assetIds: [idA, idB],
+        webBaseUrl: "https://photos.example/",
+      });
+      const body = parsePayload(out);
+      const assets = body.assets as Array<{ webUrl?: string }>;
+      expect(assets[0]!.webUrl).toMatch(/^https:\/\/photos\.example\/photos\//);
+      expect(assets[1]!.webUrl).toMatch(/^https:\/\/photos\.example\/photos\//);
+    });
+
+    it("rejects fewer than 2 ids and more than 10 (zod schema enforced)", async () => {
+      resetFakeSdk();
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const reg = (server as unknown as { _registeredTools: Record<string, { inputSchema: z.ZodTypeAny }> })._registeredTools;
+      const schema = reg["immich_compare_assets"]!.inputSchema;
+      expect(() => schema.parse({ assetIds: [idA] })).toThrow();
+      // 11 ids overshoots max(10).
+      const tooMany = Array.from({ length: 11 }, (_, i) =>
+        `${String(i + 1).repeat(8).slice(0, 8)}-1111-4111-8111-111111111111`,
+      );
+      expect(() => schema.parse({ assetIds: tooMany })).toThrow();
+    });
+  });
+
+  describe("immich_audit_active", () => {
+    it("returns expected CLIP-name-size-time buckets when none are filtered", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", []);
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            mkAsset("a", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-AAA"),
+            mkAsset("b", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-BBB"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_audit_active", {});
+      const body = parsePayload(out);
+      expect(body.safetyMode).toBe("clip-name-size-time");
+      expect(body.totalBuckets).toBe(1);
+      expect(body.skippedDueToAlbum).toBe(0);
+      expect(body.skippedDueToFavorite).toBe(0);
+      const top = body.topByReclaim as Array<{ keeper: { id: string }; discards: Array<{ id: string }> }>;
+      expect(top[0]!.keeper.id).toBe("a");
+      expect(top[0]!.discards.map((d) => d.id)).toEqual(["b"]);
+    });
+
+    it("excludeAlbumAssets: true (default) skips bucket members that are in albums", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", [{ id: "alb-1", albumName: "Curated" }]);
+      mockSdkResponse("getAlbumInfo", {
+        albumName: "Curated",
+        // Asset "b" lives in an album; it must be skipped under default exclude.
+        assets: [{ id: "b" }],
+      });
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            mkAsset("a", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-AAA"),
+            mkAsset("b", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-BBB"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_audit_active", {});
+      const body = parsePayload(out);
+      // "b" is skipped, the bucket has <2 remaining, the bucket drops.
+      expect(body.totalBuckets).toBe(0);
+      expect(body.skippedDueToAlbum).toBe(1);
+      expect(body.skippedDueToFavorite).toBe(0);
+    });
+
+    it("excludeFavorites: true (default) skips favorited assets", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", []);
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            { ...mkAsset("a", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-AAA"), isFavorite: false },
+            { ...mkAsset("b", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-BBB"), isFavorite: true },
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_audit_active", {});
+      const body = parsePayload(out);
+      expect(body.totalBuckets).toBe(0);
+      expect(body.skippedDueToFavorite).toBe(1);
+      expect(body.skippedDueToAlbum).toBe(0);
+    });
+
+    it("excludeAlbumAssets: false bypasses the album exclusion (and the index fetch)", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            mkAsset("a", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-AAA"),
+            mkAsset("b", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-BBB"),
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_audit_active", {
+        excludeAlbumAssets: false,
+        excludeFavorites: false,
+      });
+      const body = parsePayload(out);
+      expect(body.totalBuckets).toBe(1);
+      // Confirm no album fetches happened.
+      expect(sdkCalls.some((c) => c.fn === "getAllAlbums")).toBe(false);
+      expect(sdkCalls.some((c) => c.fn === "getAlbumInfo")).toBe(false);
+    });
+
+    it("skips trashed assets entirely (active library only)", async () => {
+      resetFakeSdk();
+      mockSdkResponse("getAllAlbums", []);
+      mockSdkResponse("getAssetDuplicates", [
+        {
+          duplicateId: "g1",
+          assets: [
+            mkAsset("a", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-AAA"),
+            { ...mkAsset("b", "VID.mp4", 1024, "2024-01-01T00:00:00Z", "sha1-BBB"), isTrashed: true },
+          ],
+        },
+      ]);
+      const server = new McpServer({ name: "immich-mcp", version: "0.0.0-test" });
+      registerDuplicateFlowTools(server, cfgRead);
+      const out = await callTool(server, "immich_audit_active", {});
+      const body = parsePayload(out);
+      expect(body.totalBuckets).toBe(0);
+      // The trashed asset is silently dropped (not counted as album/fav skip).
+      expect(body.skippedDueToAlbum).toBe(0);
+      expect(body.skippedDueToFavorite).toBe(0);
     });
   });
 

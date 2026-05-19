@@ -34,8 +34,19 @@ interface DupGroup {
 // Immich duplicate group:
 //   - "checksum"  -> SHA1-identical (true byte-identity). Default in v0.4.2.
 //   - "name-size" -> same originalFileName + fileSizeInByte (v0.3-v0.4.1
-//                    behavior). A weaker heuristic kept for back-compat.
+//                    behavior). Removed in v0.5.0 (returns deprecation error).
+// Retained as a string-literal type so we can accept and re-route the input
+// through resolveSafetyMode() below.
 type MatchMode = "checksum" | "name-size";
+
+// SafetyMode (v0.5.0) replaces matchMode with three levels of strictness for
+// deciding which assets inside an Immich CLIP duplicate group are safe to act
+// on:
+//   - "strict-checksum"     -> CLIP group + matching SHA1. Zero false positives.
+//   - "clip-name-size-time" -> CLIP group + same filename + size + fileCreatedAt.
+//                              Catches re-encodes and re-imports.
+//   - "clip-only"           -> CLIP group only. Most permissive; requires review.
+export type SafetyMode = "strict-checksum" | "clip-name-size-time" | "clip-only";
 
 type Category =
   | "checksum-exact"
@@ -91,6 +102,73 @@ function selectSubgroups(group: DupGroup, mode: MatchMode): Map<string, DupAsset
   return mode === "checksum" ? checksumSubgroups(group) : nameSizeSubgroups(group);
 }
 
+// v0.5.0: clip-name-size-time bucketing. CLIP grouped them, AND filename, size,
+// and fileCreatedAt all match. This is the "re-encode / re-import" detector:
+// assets that look like distinct files on disk (different SHA1) but trace back
+// to the same source moment. Drops any asset missing all three signals so we
+// never accidentally collapse on the empty-string key.
+function clipNameSizeTimeSubgroups(group: DupGroup): Map<string, DupAsset[]> {
+  const buckets = new Map<string, DupAsset[]>();
+  for (const a of group.assets) {
+    const name = a.originalFileName ?? "";
+    const size = fileSize(a);
+    const taken = a.fileCreatedAt ?? "";
+    if (!name || !size || !taken) continue;
+    const key = `${name}|${size}|${taken}`;
+    const arr = buckets.get(key) ?? [];
+    arr.push(a);
+    buckets.set(key, arr);
+  }
+  for (const k of [...buckets.keys()]) {
+    if ((buckets.get(k) ?? []).length < 2) buckets.delete(k);
+  }
+  return buckets;
+}
+
+// v0.5.0: clip-only bucketing. The entire CLIP duplicate group is treated as
+// one bucket. Most permissive mode; only sensible when the caller has already
+// verified the candidates by another channel (e.g. immich_compare_assets).
+function clipOnlySubgroups(group: DupGroup): Map<string, DupAsset[]> {
+  if (group.assets.length < 2) return new Map();
+  return new Map([[group.duplicateId, [...group.assets]]]);
+}
+
+export function selectSubgroupsBySafetyMode(
+  group: DupGroup,
+  mode: SafetyMode,
+): Map<string, DupAsset[]> {
+  if (mode === "strict-checksum") return checksumSubgroups(group);
+  if (mode === "clip-name-size-time") return clipNameSizeTimeSubgroups(group);
+  return clipOnlySubgroups(group);
+}
+
+// v0.5.0: input router. Accepts either the new `safetyMode` enum or the
+// deprecated `matchMode` alias and returns the canonical SafetyMode, or an
+// error string when the caller passed `matchMode: "name-size"` (which was the
+// v0.3-v0.4.1 unsafe heuristic and is no longer supported in v0.5.0).
+export function resolveSafetyMode(input: {
+  safetyMode?: SafetyMode;
+  matchMode?: MatchMode;
+}): SafetyMode | { error: string } {
+  if (input.safetyMode) return input.safetyMode;
+  if (input.matchMode === "checksum") return "strict-checksum";
+  if (input.matchMode === "name-size") {
+    return {
+      error:
+        "matchMode 'name-size' is no longer supported (it produced unsafe matches). " +
+        "Use safetyMode 'clip-name-size-time' for re-encode/re-import detection, " +
+        "or 'clip-only' for visual-similarity-only matching.",
+    };
+  }
+  return "strict-checksum";
+}
+
+function matchReasonForSafetyMode(mode: SafetyMode): BucketMatchReason {
+  if (mode === "strict-checksum") return "checksum-exact";
+  if (mode === "clip-name-size-time") return "clip-name-size-time";
+  return "clip-only";
+}
+
 function categorize(g: DupGroup): Category {
   if (checksumSubgroups(g).size > 0) return "checksum-exact";
   if (nameSizeSubgroups(g).size > 0) return "name-size-match";
@@ -127,13 +205,27 @@ export type EnrichedAssetRef = {
 };
 // v0.4.2: matchReason `byte-exact` is split into `checksum-exact` (real SHA1
 // match) and `name-size-match` (the weaker v0.3-v0.4.1 heuristic).
+// v0.5.0: added `clip-name-size-time` and `clip-only` to label safety-mode buckets.
 export type BucketMatchReason =
   | "checksum-exact"
   | "name-size-match"
+  | "clip-name-size-time"
+  | "clip-only"
   | "perceptual-clip"
   | "resolution-variants"
   | "burst-sequence"
   | "edits";
+
+// v0.5.0: divergence summary surfaces which signals disagree across the bucket.
+// Only populated by `immich_find_clip_dupes` (and could be by future tools);
+// strict-checksum buckets leave this undefined because divergence is moot when
+// every member shares the same SHA1.
+export type BucketDivergence = {
+  checksumsDiffer: boolean;
+  filenamesDiffer: boolean;
+  sizesDiffer: boolean;
+  takenAtDiffer: boolean;
+};
 
 export type EnrichedBucket = {
   duplicateId: string;
@@ -145,6 +237,7 @@ export type EnrichedBucket = {
   discards: EnrichedAssetRef[];
   members?: EnrichedAssetRef[];
   flagged?: { reason: string };
+  divergence?: BucketDivergence;
 };
 
 // Album lookup: returns Map<assetId, Array<{ id, name }>>.
@@ -386,23 +479,28 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
 
   server.tool(
     "immich_find_byte_dupes",
-    "Return ready-to-trash candidates by SHA1 checksum match (default) or by name+size (weaker, opt-in). Per bucket inside each duplicate group, keep the oldest, list the rest as discardIds. Album-aware: buckets with multiple in-album assets are flagged for manual review. matchMode: 'checksum' is true byte-identity; 'name-size' is the v0.3-v0.4.1 heuristic.",
+    "Return ready-to-trash candidates inside Immich CLIP duplicate groups. v0.5.0: prefer the `safetyMode` input ('strict-checksum' default, 'clip-name-size-time', 'clip-only'). Deprecated `matchMode: 'checksum'` still works as an alias for `safetyMode: 'strict-checksum'`; `matchMode: 'name-size'` returns a deprecation error. Album-aware: buckets with multiple in-album assets are flagged for manual review.",
     {
       minSizeBytes: z.number().int().min(0).optional(),
       albumAware: z.boolean().optional(),
       detailLimit: z.number().int().min(1).max(500).optional(),
       webBaseUrl: webBaseUrlSchema.optional(),
+      safetyMode: z.enum(["strict-checksum", "clip-name-size-time", "clip-only"]).optional(),
       matchMode: z.enum(["checksum", "name-size"]).optional(),
     },
-    async ({ minSizeBytes, albumAware, detailLimit, webBaseUrl, matchMode }) => {
+    async ({ minSizeBytes, albumAware, detailLimit, webBaseUrl, safetyMode, matchMode }) => {
       try {
+        const resolved = resolveSafetyMode({ safetyMode, matchMode });
+        if (typeof resolved === "object" && "error" in resolved) {
+          return asMcpError(resolved.error);
+        }
+        const mode: SafetyMode = resolved;
+        const reason: BucketMatchReason = matchReasonForSafetyMode(mode);
         const raw = await sdk.getAssetDuplicates();
         const groups = raw as unknown as DupGroup[];
         const min = minSizeBytes ?? 0;
         const aware = albumAware ?? true;
         const limit = detailLimit ?? 50;
-        const mode: MatchMode = matchMode ?? "checksum";
-        const reason: BucketMatchReason = mode === "checksum" ? "checksum-exact" : "name-size-match";
         const albumIndex = aware
           ? await buildAssetAlbumIndex()
           : new Map<string, { id: string; name: string }[]>();
@@ -421,7 +519,7 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
         let totalDiscardAssets = 0;
         let totalReclaimable = 0;
         for (const g of groups) {
-          const buckets = selectSubgroups(g, mode);
+          const buckets = selectSubgroupsBySafetyMode(g, mode);
           for (const bucket of buckets.values()) {
             const sample = bucket[0]!;
             const fname = sample.originalFileName ?? "";
@@ -458,7 +556,11 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
         const rest = sortedKept.slice(limit);
         const tailSample = deterministicTailSample(rest, 10);
         return asMcpResponse({
-          matchMode: mode,
+          safetyMode: mode,
+          // Back-compat field for v0.4.x callers. Mirrors safetyMode using the
+          // closest legacy spelling: strict-checksum echoes as "checksum"; the
+          // new modes echo their canonical name (no legacy equivalent exists).
+          matchMode: mode === "strict-checksum" ? "checksum" : mode,
           candidates,
           totalCandidates: candidates.length,
           totalDiscardAssets,
@@ -475,7 +577,7 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
 
   server.tool(
     "immich_resolve_with_keep_strategy",
-    "End-to-end dedupe. Dry-run by default. delete: true + writes enabled = soft trash (recoverable). permanent: true + confirm: true = bypass trash. matchMode: 'checksum' (SHA1, default, true byte-identity) or 'name-size' (v0.3-v0.4.1 heuristic). Album-aware skips buckets with split curation.",
+    "End-to-end dedupe. Dry-run by default. delete: true + writes enabled = soft trash (recoverable). permanent: true + confirm: true = bypass trash. v0.5.0: use `safetyMode` ('strict-checksum' default, 'clip-name-size-time', 'clip-only'); deprecated `matchMode: 'checksum'` still works, `matchMode: 'name-size'` returns a deprecation error. Album-aware skips buckets with split curation.",
     {
       strategy: z.enum(["byte_dupes_keep_oldest", "byte_dupes_keep_largest"]),
       minSizeBytes: z.number().int().min(0).optional(),
@@ -487,10 +589,17 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
       detailLimit: z.number().int().min(1).max(500).optional(),
       webBaseUrl: webBaseUrlSchema.optional(),
       exportTo: z.string().optional(),
+      safetyMode: z.enum(["strict-checksum", "clip-name-size-time", "clip-only"]).optional(),
       matchMode: z.enum(["checksum", "name-size"]).optional(),
     },
     async (args) => {
       try {
+        const resolved = resolveSafetyMode({ safetyMode: args.safetyMode, matchMode: args.matchMode });
+        if (typeof resolved === "object" && "error" in resolved) {
+          return asMcpError(resolved.error);
+        }
+        const mode: SafetyMode = resolved;
+        const reason: BucketMatchReason = matchReasonForSafetyMode(mode);
         const cap = args.maxDiscards ?? 5000;
         const raw = await sdk.getAssetDuplicates();
         const groups = raw as unknown as DupGroup[];
@@ -498,8 +607,6 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
         const aware = args.albumAware ?? true;
         const limit = args.detailLimit ?? 50;
         const webBaseUrl = args.webBaseUrl;
-        const mode: MatchMode = args.matchMode ?? "checksum";
-        const reason: BucketMatchReason = mode === "checksum" ? "checksum-exact" : "name-size-match";
         const albumIndex = aware
           ? await buildAssetAlbumIndex()
           : new Map<string, { id: string; name: string }[]>();
@@ -511,7 +618,7 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
         const flagged: EnrichedBucket[] = [];
         const min = args.minSizeBytes ?? 0;
         for (const g of groups) {
-          for (const bucket of selectSubgroups(g, mode).values()) {
+          for (const bucket of selectSubgroupsBySafetyMode(g, mode).values()) {
             const sample = bucket[0]!;
             const fname = sample.originalFileName ?? "";
             if (fileSize(sample) < min) continue;
@@ -542,7 +649,10 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
         const flaggedDetail = flagged.slice(0, limit);
         const plan = {
           strategy: args.strategy,
-          matchMode: mode,
+          safetyMode: mode,
+          // Back-compat echo: strict-checksum -> "checksum"; new modes keep
+          // their canonical name (no legacy equivalent existed).
+          matchMode: mode === "strict-checksum" ? "checksum" : mode,
           bucketsResolved: buckets,
           discardCount: discardIds.length,
           reclaimableBytes: reclaim,
@@ -590,7 +700,8 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
           dryRun: false,
           executed: true,
           strategy: args.strategy,
-          matchMode: mode,
+          safetyMode: mode,
+          matchMode: mode === "strict-checksum" ? "checksum" : mode,
           deletedCount: deleted,
           reclaimedBytes: reclaim,
           permanent: args.permanent ?? false,
@@ -675,6 +786,303 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
           total: enriched.length,
           matchReason,
           assets: enriched,
+          recommendation,
+        });
+      } catch (e) {
+        return asMcpError(surfaceError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "immich_find_clip_dupes",
+    "Find visual-but-not-byte-identical duplicate pairs (Immich CLIP grouped them but their SHA1 checksums differ). Use to surface cleanup candidates that strict-checksum mode rejects. Pure read; pair with immich_compare_assets for manual review. requireMetadataMatch: true narrows to buckets that also share filename+size+fileCreatedAt.",
+    {
+      detailLimit: z.number().int().min(1).max(500).optional(),
+      webBaseUrl: webBaseUrlSchema.optional(),
+      requireMetadataMatch: z.boolean().optional(),
+    },
+    async (args) => {
+      try {
+        const detailLimit = args.detailLimit ?? 50;
+        const requireMeta = args.requireMetadataMatch ?? false;
+        const webBaseUrl = args.webBaseUrl;
+        const raw = await withRetry("getAssetDuplicates", () => sdk.getAssetDuplicates());
+        const groups = raw as unknown as DupGroup[];
+        const buckets: EnrichedBucket[] = [];
+        const emptyAlbumIndex = new Map<string, { id: string; name: string }[]>();
+
+        for (const group of groups) {
+          // Drop byte-identical members first; they are not "CLIP-only" duplicates.
+          const byChecksum = checksumSubgroups(group);
+          const checksumMatchedIds = new Set<string>();
+          for (const sub of byChecksum.values()) for (const a of sub) checksumMatchedIds.add(a.id);
+          const remaining = group.assets.filter((a) => !checksumMatchedIds.has(a.id));
+          if (remaining.length < 2) continue;
+
+          // Either narrow to name+size+time subgroups, or treat the whole CLIP
+          // group as one bucket.
+          const candidateBuckets = requireMeta
+            ? clipNameSizeTimeSubgroups({ duplicateId: group.duplicateId, assets: remaining })
+            : new Map<string, DupAsset[]>([[group.duplicateId, remaining]]);
+
+          for (const bucket of candidateBuckets.values()) {
+            if (bucket.length < 2) continue;
+            const sorted = [...bucket].sort(
+              (a, b) =>
+                (a.fileCreatedAt ?? "").localeCompare(b.fileCreatedAt ?? "") ||
+                a.id.localeCompare(b.id),
+            );
+            const keeper = sorted[0]!;
+            const discards = sorted.slice(1);
+            const reclaim = discards.reduce((s, d) => s + fileSize(d), 0);
+            const matchReason: BucketMatchReason = requireMeta ? "clip-name-size-time" : "clip-only";
+            const enriched = buildEnrichedBucket(
+              group.duplicateId,
+              keeper.originalFileName ?? "",
+              keeper,
+              discards,
+              reclaim,
+              emptyAlbumIndex,
+              matchReason,
+              webBaseUrl,
+            );
+            enriched.divergence = {
+              checksumsDiffer:
+                new Set(bucket.map((a) => getChecksum(a) ?? "")).size > 1,
+              filenamesDiffer:
+                new Set(bucket.map((a) => a.originalFileName ?? "")).size > 1,
+              sizesDiffer: new Set(bucket.map(fileSize)).size > 1,
+              takenAtDiffer:
+                new Set(bucket.map((a) => a.fileCreatedAt ?? "")).size > 1,
+            };
+            buckets.push(enriched);
+          }
+        }
+
+        const sortedBuckets = [...buckets].sort((a, b) => b.reclaimableBytes - a.reclaimableBytes);
+        const topByReclaim = sortedBuckets.slice(0, detailLimit);
+        const rest = sortedBuckets.slice(detailLimit);
+        const tailSample = deterministicTailSample(rest, 10);
+        const totalReclaim = buckets.reduce((s, b) => s + b.reclaimableBytes, 0);
+        const totalDiscards = buckets.reduce((s, b) => s + b.discards.length, 0);
+        const recommendation = buckets.length === 0
+          ? "No visual-not-byte duplicate buckets found in the Immich duplicate groups."
+          : `Found ${buckets.length} CLIP-grouped bucket(s) with ~${(totalReclaim / 1e9).toFixed(2)} GB potential reclaim. Review with immich_compare_assets before bulk action. Use immich_resolve_with_keep_strategy safetyMode='${requireMeta ? "clip-name-size-time" : "clip-only"}' to act on them.`;
+
+        return asMcpResponse({
+          requireMetadataMatch: requireMeta,
+          totalBuckets: buckets.length,
+          totalDiscardAssets: totalDiscards,
+          totalReclaimableBytes: totalReclaim,
+          topByReclaim,
+          tailSample,
+          recommendation,
+        });
+      } catch (e) {
+        return asMcpError(surfaceError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "immich_compare_assets",
+    "Side-by-side metadata comparison of 2-10 assets. Returns per-asset checksum, size, EXIF, taken-at, location, albums, plus a top-level divergence summary and a one-line recommendation. Use for manual verification before bulk dedup action.",
+    {
+      assetIds: z.array(Uuid).min(2).max(10),
+      webBaseUrl: webBaseUrlSchema.optional(),
+    },
+    async ({ assetIds, webBaseUrl }) => {
+      try {
+        const fetched = await Promise.all(
+          assetIds.map((id) =>
+            withRetry(`getAssetInfo:${id}`, () => sdk.getAssetInfo({ id })),
+          ),
+        );
+        const albumIndex = await buildAssetAlbumIndex();
+        const assets = fetched.map((raw) => {
+          const a = raw as unknown as {
+            id: string;
+            originalFileName?: string;
+            fileCreatedAt?: string;
+            fileModifiedAt?: string;
+            originalPath?: string;
+            type?: string;
+            duration?: string;
+            isFavorite?: boolean;
+            isArchived?: boolean;
+            isTrashed?: boolean;
+            checksum?: string;
+            exifInfo?: {
+              fileSizeInByte?: number;
+              make?: string;
+              model?: string;
+              dateTimeOriginal?: string;
+              latitude?: number;
+              longitude?: number;
+              city?: string;
+              country?: string;
+              fNumber?: number;
+              focalLength?: number;
+              iso?: number;
+              exposureTime?: string;
+            };
+          };
+          const albums = (albumIndex.get(a.id) ?? []).map((al) => ({ id: al.id, name: al.name }));
+          return {
+            id: a.id,
+            filename: a.originalFileName ?? "",
+            size: Number(a.exifInfo?.fileSizeInByte ?? 0),
+            checksum: a.checksum ?? "",
+            fileCreatedAt: a.fileCreatedAt,
+            fileModifiedAt: a.fileModifiedAt,
+            originalPath: a.originalPath,
+            type: a.type,
+            duration: a.duration,
+            isFavorite: a.isFavorite ?? false,
+            isArchived: a.isArchived ?? false,
+            isTrashed: a.isTrashed ?? false,
+            exif: {
+              make: a.exifInfo?.make,
+              model: a.exifInfo?.model,
+              dateTimeOriginal: a.exifInfo?.dateTimeOriginal,
+              latitude: a.exifInfo?.latitude,
+              longitude: a.exifInfo?.longitude,
+              city: a.exifInfo?.city,
+              country: a.exifInfo?.country,
+              fNumber: a.exifInfo?.fNumber,
+              focalLength: a.exifInfo?.focalLength,
+              iso: a.exifInfo?.iso,
+              exposureTime: a.exifInfo?.exposureTime,
+            },
+            albums,
+            webUrl: buildWebUrl(webBaseUrl, a.id),
+          };
+        });
+
+        const divergence = {
+          checksumsDiffer: new Set(assets.map((a) => a.checksum)).size > 1,
+          filenamesDiffer: new Set(assets.map((a) => a.filename)).size > 1,
+          sizesDiffer: new Set(assets.map((a) => a.size)).size > 1,
+          takenAtDiffer: new Set(assets.map((a) => a.fileCreatedAt ?? "")).size > 1,
+          locationsDiffer:
+            new Set(assets.map((a) => `${a.exif.latitude ?? ""}|${a.exif.longitude ?? ""}`)).size > 1,
+          devicesDiffer:
+            new Set(assets.map((a) => `${a.exif.make ?? ""}|${a.exif.model ?? ""}`)).size > 1,
+        };
+
+        let recommendation: string;
+        if (!divergence.checksumsDiffer) {
+          recommendation =
+            "All assets are byte-identical (same SHA1). Safe to dedupe with safetyMode='strict-checksum'.";
+        } else if (
+          !divergence.filenamesDiffer &&
+          !divergence.sizesDiffer &&
+          !divergence.takenAtDiffer
+        ) {
+          recommendation =
+            "Assets share filename, size, and taken-at but have different SHA1s. Likely re-encodes or re-imports of the same source. Safe candidate for safetyMode='clip-name-size-time'.";
+        } else if (divergence.devicesDiffer || divergence.locationsDiffer) {
+          recommendation =
+            "Assets differ on device or location metadata. NOT recommended to dedupe; these are likely distinct captures.";
+        } else {
+          recommendation =
+            "Mixed signals. Eyeball each asset's webUrl before any bulk action.";
+        }
+
+        return asMcpResponse({ assets, divergence, recommendation });
+      } catch (e) {
+        return asMcpError(surfaceError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "immich_audit_active",
+    "Find CLIP-grouped duplicate candidates STILL in the active library (post-cleanup housekeeping). Defaults skip assets that are in albums or marked favorite. safetyMode defaults to 'clip-name-size-time'. Returns reclaim estimate, skipped counts, and a recommendation string.",
+    {
+      safetyMode: z.enum(["clip-name-size-time", "clip-only"]).optional(),
+      excludeAlbumAssets: z.boolean().optional(),
+      excludeFavorites: z.boolean().optional(),
+      detailLimit: z.number().int().min(1).max(500).optional(),
+      webBaseUrl: webBaseUrlSchema.optional(),
+    },
+    async (args) => {
+      try {
+        const mode: SafetyMode = args.safetyMode ?? "clip-name-size-time";
+        const skipAlbums = args.excludeAlbumAssets ?? true;
+        const skipFavs = args.excludeFavorites ?? true;
+        const detailLimit = args.detailLimit ?? 50;
+        const webBaseUrl = args.webBaseUrl;
+
+        const raw = await withRetry("getAssetDuplicates", () => sdk.getAssetDuplicates());
+        const groups = raw as unknown as DupGroup[];
+        const albumIndex = skipAlbums
+          ? await buildAssetAlbumIndex()
+          : new Map<string, { id: string; name: string }[]>();
+
+        let skippedAlbum = 0;
+        let skippedFav = 0;
+        const buckets: EnrichedBucket[] = [];
+        const reason: BucketMatchReason = matchReasonForSafetyMode(mode);
+
+        for (const group of groups) {
+          const subgroups = selectSubgroupsBySafetyMode(group, mode);
+          for (const sub of subgroups.values()) {
+            const filtered = sub.filter((a) => {
+              const meta = a as unknown as { isFavorite?: boolean; isTrashed?: boolean };
+              if (meta.isTrashed === true) return false; // active only
+              const inAlbum = (albumIndex.get(a.id) ?? []).length > 0;
+              if (skipAlbums && inAlbum) {
+                skippedAlbum++;
+                return false;
+              }
+              if (skipFavs && meta.isFavorite === true) {
+                skippedFav++;
+                return false;
+              }
+              return true;
+            });
+            if (filtered.length < 2) continue;
+            const sorted = [...filtered].sort(
+              (a, b) =>
+                (a.fileCreatedAt ?? "").localeCompare(b.fileCreatedAt ?? "") ||
+                a.id.localeCompare(b.id),
+            );
+            const keeper = sorted[0]!;
+            const discards = sorted.slice(1);
+            const reclaim = discards.reduce((s, d) => s + fileSize(d), 0);
+            buckets.push(
+              buildEnrichedBucket(
+                group.duplicateId,
+                keeper.originalFileName ?? "",
+                keeper,
+                discards,
+                reclaim,
+                albumIndex,
+                reason,
+                webBaseUrl,
+              ),
+            );
+          }
+        }
+
+        const sortedBuckets = [...buckets].sort((a, b) => b.reclaimableBytes - a.reclaimableBytes);
+        const topByReclaim = sortedBuckets.slice(0, detailLimit);
+        const totalReclaim = buckets.reduce((s, b) => s + b.reclaimableBytes, 0);
+        const totalDiscards = buckets.reduce((s, b) => s + b.discards.length, 0);
+        const recommendation = buckets.length === 0
+          ? `No housekeeping candidates found in active library (safetyMode: ${mode}).`
+          : `${buckets.length} candidate bucket(s) in active library, ~${(totalReclaim / 1e9).toFixed(2)} GB potential reclaim. ${skippedAlbum} asset(s) skipped because they are in albums; ${skippedFav} skipped because favorited. Review with immich_compare_assets, then act with immich_resolve_with_keep_strategy safetyMode='${mode}'.`;
+
+        return asMcpResponse({
+          safetyMode: mode,
+          totalBuckets: buckets.length,
+          totalDiscardAssets: totalDiscards,
+          totalReclaimableBytes: totalReclaim,
+          skippedDueToAlbum: skippedAlbum,
+          skippedDueToFavorite: skippedFav,
+          topByReclaim,
           recommendation,
         });
       } catch (e) {
