@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file. Format foll
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-18
+
+### Fixed
+- `buildAssetAlbumIndex` now fails fast on errors instead of silently returning an empty map. With `albumAware: true` (the default), a 403/500/SDK shape change in the albums endpoint used to silently downgrade the keeper decision to strategy-only, which could trash curated assets. Errors now propagate to the tool handler and surface as a clear MCP error.
+- `exportTo` in `immich_resolve_with_keep_strategy` is now gated by `IMMICH_ALLOW_WRITES` (it is a filesystem write). Previously a caller with writes disabled could still cause the CSV to be written. The CSV writer also now (1) verifies the parent directory exists and surfaces a clear error otherwise, and (2) uses the `wx` flag so it refuses to overwrite an existing file.
+- CSV cells whose values begin with `=`, `+`, `-`, `@`, `\t`, or `\r` are now prefixed with a single quote to neutralize spreadsheet formula injection (CWE-1236) before the cell is RFC-4180 quoted.
+- `immich_explain_duplicate_group` recommendation is now deterministic across runs (final tiebreaker on asset id) and the `rationale` only mentions signals that actually contributed to the winner over the runner-up. The previous version always appended "oldest" even when the pick was driven by album membership or favorite status.
+- `webBaseUrl` inputs are now schema-validated to `http://` or `https://` only (previously `z.string().url()` accepted `javascript:`, `ftp:`, etc.), and asset ids are URL-encoded into the path to handle ids with spaces or reserved characters.
+- `tailSample` now actually samples the long tail: the 10 buckets with the lowest reclaimable bytes (tiebroken on `duplicateId`), instead of the lex-first 10 by `duplicateId`.
+
+### Changed (behavior change)
+- `EnrichedBucket` shape for flagged buckets: `keeper` is now `null` and `discards` is `[]` instead of an arbitrary placeholder. A new optional `members: EnrichedAssetRef[]` array contains every asset in the flagged bucket so callers can still display the data. Flagged buckets also report `reclaimableBytes: 0` (nothing was selected). The CSV writer emits empty cells for `keeperId`/`keeperFileCreatedAt`/`keeperAlbums`/`discardIds`/`discardAlbums` on flagged rows.
+- `immich_categorize_duplicates` output keys are now hyphenated (`byte-exact`, `resolution-variants`, `burst-sequence`) instead of snake_case (`byte_exact`, `resolution_variants`, `burst_sequence`). This unifies the category vocabulary with the bucket-level `matchReason` field that was already hyphenated. v0.2.0 shipped snake_case and v0.4.0 introduced the inconsistency by hyphenating `matchReason`; v0.4.1 fixes it before it becomes entrenched. Backward-incompatible for callers that consume `byCategory.*` by name.
+
 ## [0.4.0] - 2026-05-18
 
 ### Added
