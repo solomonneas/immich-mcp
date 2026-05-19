@@ -1,3 +1,4 @@
+import { promises as fs } from "node:fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as sdk from "@immich/sdk";
@@ -151,6 +152,85 @@ export function pickKeeperWithAlbums(
 export const RESTORE_NOTE =
   "Trashed assets are recoverable for 30 days. Use immich_restore_by_query (or your Immich web UI > Library > Trash) to restore. Permanent removal: auto at 30d OR via immich_empty_trash (writes + confirm).";
 
+// CSV helpers (RFC 4180 ish).
+function csvEscape(value: unknown): string {
+  const s = value === null || value === undefined ? "" : String(value);
+  if (/[,"\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+export async function writePlanCsv(path: string, rows: EnrichedBucket[]): Promise<void> {
+  const header = [
+    "duplicateId", "filename", "size", "reclaimableBytes", "matchReason",
+    "keeperId", "keeperFileCreatedAt", "keeperAlbums",
+    "discardIds", "discardAlbums",
+    "flagged", "flaggedReason",
+  ].join(",");
+  const body = rows.map((b) => [
+    b.duplicateId, b.filename, b.size, b.reclaimableBytes, b.matchReason,
+    b.keeper.id, b.keeper.fileCreatedAt ?? "", b.keeper.albumNames.join(";"),
+    b.discards.map((d) => d.id).join(";"),
+    b.discards.flatMap((d) => d.albumNames).join(";"),
+    b.flagged ? "true" : "false",
+    b.flagged?.reason ?? "",
+  ].map(csvEscape).join(",")).join("\n");
+  const content = body.length > 0 ? header + "\n" + body + "\n" : header + "\n";
+  await fs.writeFile(path, content, "utf8");
+}
+
+// Deterministic shuffle for tailSample: stable order based on a slice of the duplicateId.
+function deterministicTailSample(buckets: EnrichedBucket[], count: number): EnrichedBucket[] {
+  const sorted = [...buckets].sort((a, b) =>
+    a.duplicateId.slice(0, 8).localeCompare(b.duplicateId.slice(0, 8)),
+  );
+  return sorted.slice(0, count);
+}
+
+function buildEnrichedBucket(
+  duplicateId: string,
+  filename: string,
+  keeper: DupAsset,
+  discards: DupAsset[],
+  reclaimableBytes: number,
+  albumIndex: Map<string, { id: string; name: string }[]>,
+  webBaseUrl?: string,
+  flagged?: { reason: string },
+): EnrichedBucket {
+  return {
+    duplicateId,
+    filename,
+    size: fileSize(keeper),
+    reclaimableBytes,
+    matchReason: "byte-exact",
+    keeper: enrichAsset(keeper, albumIndex, webBaseUrl),
+    discards: discards.map((d) => enrichAsset(d, albumIndex, webBaseUrl)),
+    ...(flagged ? { flagged } : {}),
+  };
+}
+
+// Flagged buckets have a keeper-less shape; we still emit something useful for display.
+// Use the first bucket member as the placeholder keeper so the row schema stays consistent.
+function buildFlaggedBucket(
+  duplicateId: string,
+  filename: string,
+  bucket: DupAsset[],
+  albumIndex: Map<string, { id: string; name: string }[]>,
+  webBaseUrl: string | undefined,
+  reason: string,
+): EnrichedBucket {
+  const reclaimableBytes = bucket.slice(1).reduce((s, a) => s + fileSize(a), 0);
+  return {
+    duplicateId,
+    filename,
+    size: fileSize(bucket[0]!),
+    reclaimableBytes,
+    matchReason: "byte-exact",
+    keeper: enrichAsset(bucket[0]!, albumIndex, webBaseUrl),
+    discards: bucket.slice(1).map((d) => enrichAsset(d, albumIndex, webBaseUrl)),
+    flagged: { reason },
+  };
+}
+
 export function registerDuplicateFlowTools(server: McpServer, config: Config): void {
   server.tool(
     "immich_categorize_duplicates",
@@ -183,13 +263,24 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
 
   server.tool(
     "immich_find_byte_dupes",
-    "Return ready-to-trash candidates: per (filename, size) bucket inside each duplicate group, keep the oldest, list the rest as discardIds.",
-    { minSizeBytes: z.number().int().min(0).optional() },
-    async ({ minSizeBytes }) => {
+    "Return ready-to-trash candidates: per (filename, size) bucket inside each duplicate group, keep the oldest, list the rest as discardIds. Album-aware: buckets with multiple in-album assets are flagged for manual review.",
+    {
+      minSizeBytes: z.number().int().min(0).optional(),
+      albumAware: z.boolean().optional(),
+      detailLimit: z.number().int().min(1).max(500).optional(),
+      webBaseUrl: z.string().url().optional(),
+    },
+    async ({ minSizeBytes, albumAware, detailLimit, webBaseUrl }) => {
       try {
         const raw = await sdk.getAssetDuplicates();
         const groups = raw as unknown as DupGroup[];
         const min = minSizeBytes ?? 0;
+        const aware = albumAware ?? true;
+        const limit = detailLimit ?? 50;
+        const albumIndex = aware
+          ? await buildAssetAlbumIndex()
+          : new Map<string, { id: string; name: string }[]>();
+
         const candidates: Array<{
           duplicateId: string;
           filename: string;
@@ -199,35 +290,56 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
           reclaimableBytes: number;
           matchReason: "byte-exact";
         }> = [];
+        const enrichedKept: EnrichedBucket[] = [];
+        const flagged: EnrichedBucket[] = [];
         let totalDiscardAssets = 0;
         let totalReclaimable = 0;
         for (const g of groups) {
           const buckets = byteDupeSubgroups(g);
           for (const [key, bucket] of buckets.entries()) {
-            const keeper = pickKeeper(bucket, "oldest");
-            const size = fileSize(keeper);
+            const [filename] = key.split("|");
+            const fname = filename ?? "";
+            const sample = bucket[0]!;
+            const size = fileSize(sample);
             if (size < min) continue;
+            const decision = pickKeeperWithAlbums(bucket, "oldest", albumIndex, aware);
+            if (decision.flagged) {
+              flagged.push(
+                buildFlaggedBucket(g.duplicateId, fname, bucket, albumIndex, webBaseUrl, decision.flagged.reason),
+              );
+              continue;
+            }
+            const keeper = decision.keeper!;
             const discards = bucket.filter((a) => a.id !== keeper.id);
             const reclaim = discards.reduce((s, a) => s + fileSize(a), 0);
-            const [filename] = key.split("|");
             candidates.push({
               duplicateId: g.duplicateId,
-              filename: filename ?? "",
+              filename: fname,
               size,
               keeperId: keeper.id,
               discardIds: discards.map((a) => a.id),
               reclaimableBytes: reclaim,
               matchReason: "byte-exact",
             });
+            enrichedKept.push(
+              buildEnrichedBucket(g.duplicateId, fname, keeper, discards, reclaim, albumIndex, webBaseUrl),
+            );
             totalDiscardAssets += discards.length;
             totalReclaimable += reclaim;
           }
         }
+        const sortedKept = [...enrichedKept].sort((a, b) => b.reclaimableBytes - a.reclaimableBytes);
+        const topByReclaim = sortedKept.slice(0, limit);
+        const rest = sortedKept.slice(limit);
+        const tailSample = deterministicTailSample(rest, 10);
         return asMcpResponse({
           candidates,
           totalCandidates: candidates.length,
           totalDiscardAssets,
           totalReclaimableBytes: totalReclaimable,
+          flagged,
+          topByReclaim,
+          tailSample,
         });
       } catch (e) {
         return asMcpError(surfaceError(e));
@@ -237,7 +349,7 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
 
   server.tool(
     "immich_resolve_with_keep_strategy",
-    "End-to-end dedupe. Dry-run by default. delete: true + writes enabled = soft trash (recoverable). permanent: true + confirm: true = bypass trash.",
+    "End-to-end dedupe. Dry-run by default. delete: true + writes enabled = soft trash (recoverable). permanent: true + confirm: true = bypass trash. Album-aware skips buckets with split curation.",
     {
       strategy: z.enum(["byte_dupes_keep_oldest", "byte_dupes_keep_largest"]),
       minSizeBytes: z.number().int().min(0).optional(),
@@ -245,6 +357,10 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
       permanent: z.boolean().optional(),
       confirm: z.boolean().optional(),
       maxDiscards: z.number().int().min(1).max(20000).optional(),
+      albumAware: z.boolean().optional(),
+      detailLimit: z.number().int().min(1).max(500).optional(),
+      webBaseUrl: z.string().url().optional(),
+      exportTo: z.string().optional(),
     },
     async (args) => {
       try {
@@ -252,30 +368,77 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
         const raw = await sdk.getAssetDuplicates();
         const groups = raw as unknown as DupGroup[];
         const keepBy = args.strategy === "byte_dupes_keep_largest" ? "largest" : "oldest";
+        const aware = args.albumAware ?? true;
+        const limit = args.detailLimit ?? 50;
+        const webBaseUrl = args.webBaseUrl;
+        const albumIndex = aware
+          ? await buildAssetAlbumIndex()
+          : new Map<string, { id: string; name: string }[]>();
+
         const discardIds: string[] = [];
         let reclaim = 0;
         let buckets = 0;
+        const enrichedKept: EnrichedBucket[] = [];
+        const flagged: EnrichedBucket[] = [];
         const min = args.minSizeBytes ?? 0;
         for (const g of groups) {
-          for (const bucket of byteDupeSubgroups(g).values()) {
-            const keeper = pickKeeper(bucket, keepBy);
-            if (fileSize(keeper) < min) continue;
-            buckets++;
-            for (const a of bucket) {
-              if (a.id === keeper.id) continue;
-              discardIds.push(a.id);
-              reclaim += fileSize(a);
+          for (const [key, bucket] of byteDupeSubgroups(g).entries()) {
+            const [filename] = key.split("|");
+            const fname = filename ?? "";
+            const sample = bucket[0]!;
+            if (fileSize(sample) < min) continue;
+            const decision = pickKeeperWithAlbums(bucket, keepBy, albumIndex, aware);
+            if (decision.flagged) {
+              flagged.push(
+                buildFlaggedBucket(g.duplicateId, fname, bucket, albumIndex, webBaseUrl, decision.flagged.reason),
+              );
+              continue;
             }
+            const keeper = decision.keeper!;
+            buckets++;
+            const discards = bucket.filter((a) => a.id !== keeper.id);
+            const reclaimBucket = discards.reduce((s, a) => s + fileSize(a), 0);
+            for (const a of discards) {
+              discardIds.push(a.id);
+            }
+            reclaim += reclaimBucket;
+            enrichedKept.push(
+              buildEnrichedBucket(g.duplicateId, fname, keeper, discards, reclaimBucket, albumIndex, webBaseUrl),
+            );
           }
         }
+        const sortedKept = [...enrichedKept].sort((a, b) => b.reclaimableBytes - a.reclaimableBytes);
+        const topByReclaim = sortedKept.slice(0, limit);
+        const rest = sortedKept.slice(limit);
+        const tailSample = deterministicTailSample(rest, 10);
+        const flaggedDetail = flagged.slice(0, limit);
         const plan = {
           strategy: args.strategy,
           bucketsResolved: buckets,
           discardCount: discardIds.length,
           reclaimableBytes: reclaim,
+          flaggedCount: flagged.length,
         };
+
+        let exportPath: string | undefined;
+        let exportRowCount: number | undefined;
+        if (args.exportTo) {
+          const rows = [...enrichedKept, ...flagged];
+          await writePlanCsv(args.exportTo, rows);
+          exportPath = args.exportTo;
+          exportRowCount = rows.length;
+        }
+
         if (args.delete !== true) {
-          return asMcpResponse({ dryRun: true, plan, restoreNote: RESTORE_NOTE });
+          return asMcpResponse({
+            dryRun: true,
+            plan,
+            flagged: flaggedDetail,
+            topByReclaim,
+            tailSample,
+            ...(exportPath ? { exportPath, exportRowCount } : {}),
+            restoreNote: RESTORE_NOTE,
+          });
         }
         requireWrites(config);
         if (args.permanent === true) requireConfirm("immich_resolve_with_keep_strategy", args.confirm);
@@ -298,6 +461,8 @@ export function registerDuplicateFlowTools(server: McpServer, config: Config): v
           deletedCount: deleted,
           reclaimedBytes: reclaim,
           permanent: args.permanent ?? false,
+          flaggedCount: flagged.length,
+          ...(exportPath ? { exportPath, exportRowCount } : {}),
           restoreNote: RESTORE_NOTE,
         });
       } catch (e) {
