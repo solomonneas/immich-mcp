@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file. Format foll
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-18
+
+### Added
+- `immich_explain_duplicate_group` tool for per-group drill-in (assets + album memberships + recommended keeper).
+- Album-aware keeper selection in `immich_find_byte_dupes` and `immich_resolve_with_keep_strategy` (input: `albumAware`, default `true`). Buckets with split curation are flagged for manual review instead of swept.
+- Enriched per-bucket detail in dry-run output: `topByReclaim`, `tailSample`, `flagged` arrays with keeper + discards + album memberships + optional web URLs.
+- `matchReason` field on every dedup bucket.
+- `restoreNote` field on every resolve response (clarifies undo path).
+- CSV export for resolve plans via `exportTo` input.
+
+### Changed
+- `immich_find_byte_dupes` output shape extends to include `topByReclaim`, `tailSample`, `flagged`. Existing `candidates` array preserved for back-compat.
+- `immich_resolve_with_keep_strategy` dry-run output shape extends similarly. Existing `plan` aggregate preserved.
+
 ## [0.3.1] - 2026-05-18
 
 ### Fixed
